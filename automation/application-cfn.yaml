@@ -1,0 +1,230 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: CloudFormation Template to create a ec2 instance with apache web server.
+
+#------------------------
+#   METADATA
+#------------------------
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Compute Configuration
+        Parameters:
+          - TemplateName
+          - InstanceImageId
+          - InstanceType
+
+      - Label:
+          default: Email Address
+        Parameters:
+          - OperatorEmail
+
+#------------------------
+#   PARAMETERS
+#------------------------
+
+Parameters:
+  TemplateName:
+    Type: String
+    Description: Enter the name of your resource you are creating.
+    Default: jambo-tingatinga
+
+  InstanceImageId:
+    Type: String
+    Default: ami-051f8a213df8bc089 # Amazon Linux
+    Description: Amazon Linux Instance type.
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: Instance family and type.
+
+  OperatorEmail:
+    Type: String
+    Default: joelogira@gmail.com
+    Description: This will notify of scaling activities.
+
+#------------------------
+#   RESOURCES
+#------------------------
+
+Resources:
+  ## Our EC2 SSH Key
+  KeyName:
+    Type: "AWS::EC2::KeyPair"
+    Properties:
+      KeyName: !Join ["-", [!Ref TemplateName, "key-pair"]]
+
+  # Our EC2 security group
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSH and HTTP
+      VpcId:
+        Fn::ImportValue: !Sub VPC
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: 22
+          IpProtocol: tcp
+          ToPort: 22
+        - CidrIp: 0.0.0.0/0
+          FromPort: 80
+          IpProtocol: tcp
+          ToPort: 80
+
+  #Configuring launch template
+  LaunchTemplate:
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateName: !Ref TemplateName
+      LaunchTemplateData:
+        Monitoring:
+          Enabled: true
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: yes
+            DeleteOnTermination: yes
+            Groups:
+              - !Ref SecurityGroup
+        ImageId: !Ref InstanceImageId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            amazon-linux-extras install -y lamp-mariadb10.2-php7.2 php7.2
+            yum install -y httpd mariadb-server
+            systemctl start httpd
+            systemctl enable httpd
+            systemctl start mariadb
+            systemctl enable mariadb
+            wget https://wordpress.org/latest.tar.gz
+            tar -xzf latest.tar.gz
+            cp -r wordpress/* /var/www/html/
+            rm -rf /var/www/html/index.html
+            chown -R apache:apache /var/www/html
+            systemctl restart httpd
+            echo "WordPress installation complete."
+
+  # Creating sns topic
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref OperatorEmail
+          Protocol: email
+
+  #Creating an Auto Scaling Group
+  AutoScalingGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      AutoScalingGroupName: Jambo Tingatinga ASG
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      HealthCheckGracePeriod: 300
+      HealthCheckType: ELB
+      MaxSize: 3
+      MinSize: 1
+      DesiredCapacity: 1
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub PublicSubnet1
+        - Fn::ImportValue: !Sub PublicSubnet2
+        - Fn::ImportValue: !Sub PublicSubnet3
+      Tags:
+        - Key: Name
+          Value: JamboTinga-ASG
+          PropagateAtLaunch: true
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      NotificationConfiguration:
+        TopicARN: !Ref NotificationTopic
+        NotificationTypes:
+          - "autoscaling:EC2_INSTANCE_LAUNCH"
+          - "autoscaling:EC2_INSTANCE_LAUNCH_ERROR"
+          - "autoscaling:EC2_INSTANCE_TERMINATE"
+          - "autoscaling:EC2_INSTANCE_TERMINATE_ERROR"
+
+  #Creating an Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Name: JamboTingaALB
+      SecurityGroups:
+        - !Ref SecurityGroup
+      Subnets:
+        - Fn::ImportValue: !Sub PublicSubnet1
+        - Fn::ImportValue: !Sub PublicSubnet2
+        - Fn::ImportValue: !Sub PublicSubnet3
+
+  #Configuring Application Load Balancer Target Group
+  ALBTargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      Name: JamboTingaALBTargetGroup
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 20
+      HealthCheckTimeoutSeconds: 5
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 4
+      VpcId:
+        Fn::ImportValue: !Sub VPC
+
+  #Scaling Up Policy
+  ScalingUpPolicy:
+    Type: "AWS::AutoScaling::ScalingPolicy"
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 60
+      ScalingAdjustment: 1
+
+  #Scaling Down Policy
+  ScalingDownPolicy:
+    Type: "AWS::AutoScaling::ScalingPolicy"
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 60
+      ScalingAdjustment: -1
+
+  #CloudWatch Alarm High
+  CloudWatchAlarmHigh:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      EvaluationPeriods: 2
+      Statistic: Average
+      Threshold: 90
+      AlarmDescription: Scale-Up when CPU > 90% for 10 minutes
+      Period: 300
+      AlarmActions:
+        - !Ref ScalingUpPolicy
+      Namespace: AWS/EC2
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      ComparisonOperator: GreaterThanThreshold
+      MetricName: CPUUtilization
+
+  #CloudWatch Alarm Low
+  CloudWatchAlarmLow:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      EvaluationPeriods: 2
+      Statistic: Average
+      Threshold: 70
+      AlarmDescription: Scale-Up when CPU < 70% for 10 minutes
+      Period: 300
+      AlarmActions:
+        - !Ref ScalingDownPolicy
+      Namespace: AWS/EC2
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      ComparisonOperator: LessThanThreshold
+      MetricName: CPUUtilization
